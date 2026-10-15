@@ -63,7 +63,12 @@ interface MemoizedEvaluation<T> {
   readonly dependencies: SemanticDependencyProof;
 }
 
-/** Provenance lives for one query; live values belong to the effects-aware state. */
+interface SourceReadMemo {
+  readonly primitives: Map<string, JavaScriptSemanticValue>;
+  readonly bindings: Map<string, CallerIndependentBindingValue>;
+}
+
+/** Query-local provenance and source reads; shared values belong to the state. */
 interface EvaluationMemo {
   readonly provenance: Map<
     string,
@@ -71,6 +76,8 @@ interface EvaluationMemo {
   >;
   readonly dependencyFrames: { proof: SemanticDependencyProof }[];
   readonly dependencies: SemanticDependencyProofs;
+  /** Each source-read capture and live state have separate query-local values. */
+  readonly sourceReads: Map<t.Node | undefined, SourceReadMemo>;
 }
 
 // Indexing owns stable binding identities; effects invalidate values, not this
@@ -88,7 +95,12 @@ const createEvaluationMemo = (
     dependencies = new SemanticDependencyProofs(state.bindingsById.keys());
     dependencyProofsByState.set(state, dependencies);
   }
-  return { provenance: new Map(), dependencyFrames: [], dependencies };
+  return {
+    provenance: new Map(),
+    dependencyFrames: [],
+    dependencies,
+    sourceReads: new Map(),
+  };
 };
 
 interface EvaluationContext {
@@ -98,6 +110,8 @@ interface EvaluationContext {
   readonly expressionDepth: number;
   readonly capturePoint?: t.Node;
   readonly primitiveBindingValues: Map<string, JavaScriptSemanticValue>;
+  /** Branch operands use source reads and must not reuse whole-binding values. */
+  readonly sourceReadValues?: Map<string, CallerIndependentBindingValue>;
   readonly dependence: EvaluationDependence;
   readonly memo: EvaluationMemo;
 }
@@ -310,10 +324,15 @@ const evaluateBinding = (
     )
   ) {
     const { capturePoint: _capturePoint, ...liveContext } = context;
-    return evaluateBinding(binding, {
-      ...liveContext,
-      primitiveBindingValues: primitiveBindingValuesFor(context.state),
-    });
+    return evaluateBinding(
+      binding,
+      context.sourceReadValues === undefined
+        ? {
+            ...liveContext,
+            primitiveBindingValues: primitiveBindingValuesFor(context.state),
+          }
+        : sourceReadContextAt(liveContext, undefined),
+    );
   }
   const cached = context.primitiveBindingValues.get(binding.bindingId);
   if (cached !== undefined) return cached;
@@ -322,9 +341,10 @@ const evaluateBinding = (
   // nesting. A deeper reader derives it again: the retained value would carry
   // more nesting than the remaining depth budget allows it to observe.
   const independent =
-    context.capturePoint === undefined
+    context.sourceReadValues ??
+    (context.capturePoint === undefined
       ? callerIndependentBindingValuesFor(context.state)
-      : undefined;
+      : undefined);
   const retained = independent?.get(binding.bindingId);
   if (
     retained !== undefined &&
@@ -482,23 +502,10 @@ const evaluateExpressionValue = (
   }
   const literal = readExactJavaScriptLiteral(node);
   if (literal.found) return primitiveSet([literal.value]);
-  if (t.isIdentifier(node)) {
-    const binding = resolveSemanticBindingState(context.state, node, node.name);
-    return binding === undefined
-      ? { status: "unknown", reason: `Unbound identifier ${node.name}.` }
-      : evaluateBinding(binding, nestedContext(context));
-  }
+  if (t.isIdentifier(node)) return evaluateIdentifier(node, context);
   if (t.isTemplateLiteral(node)) return evaluateTemplate(node, context);
-  if (t.isConditionalExpression(node))
-    return mergeValues([
-      evaluateExpression(node.consequent, nestedContext(context)),
-      evaluateExpression(node.alternate, nestedContext(context)),
-    ]);
-  if (t.isLogicalExpression(node))
-    return mergeValues([
-      evaluateExpression(node.left, nestedContext(context)),
-      evaluateExpression(node.right, nestedContext(context)),
-    ]);
+  if (t.isConditionalExpression(node) || t.isLogicalExpression(node))
+    return evaluateBranches(node, context);
   if (t.isObjectExpression(node)) return evaluateObject(node, context);
   if (t.isArrayExpression(node)) return evaluateArray(node, context);
   if (t.isMemberExpression(node) || t.isOptionalMemberExpression(node))
@@ -507,6 +514,107 @@ const evaluateExpressionValue = (
     return evaluateAddition(node, context);
   if (t.isUnaryExpression(node)) return evaluateUnary(node, context);
   return { status: "unknown", reason: `Unsupported ${node.type} value.` };
+};
+
+const evaluateIdentifier = (
+  node: t.Identifier,
+  context: EvaluationContext,
+): JavaScriptSemanticValue => {
+  const binding = resolveSemanticBindingState(context.state, node, node.name);
+  if (binding !== undefined && context.sourceReadValues !== undefined) {
+    const selected = semanticReadInitializers(
+      binding,
+      node,
+      context.state.parentsByNode,
+    );
+    // Both hoisted vars and declared-but-unassigned lexical bindings can supply
+    // undefined before an unordered write. A lexical declaration initializer
+    // itself is preceded by a TDZ rather than a competing primitive value.
+    if (
+      selected.initializers !== binding.initializers ||
+      (selected.ordering === "unknown" &&
+        (binding.declarationKinds.has("var") ||
+          binding.definitions.some(({ kind }) => kind === "assignment")))
+    ) {
+      recordBindingDependency(binding, context);
+      return {
+        status: "unknown",
+        reason: `Binding ${binding.name} is not constant at this source read.`,
+      };
+    }
+  }
+  return binding === undefined
+    ? { status: "unknown", reason: `Unbound identifier ${node.name}.` }
+    : evaluateBinding(binding, nestedContext(context));
+};
+
+/** Source-read ordering and capture timing are independent facts. */
+const sourceReadContextAt = (
+  context: EvaluationContext,
+  capturePoint: t.Node | undefined,
+): EvaluationContext => {
+  let values = context.memo.sourceReads.get(capturePoint);
+  if (values === undefined) {
+    values = { primitives: new Map(), bindings: new Map() };
+    context.memo.sourceReads.set(capturePoint, values);
+  }
+  const { capturePoint: _capturePoint, ...readContext } = context;
+  return {
+    ...readContext,
+    ...(capturePoint === undefined ? {} : { capturePoint }),
+    primitiveBindingValues: values.primitives,
+    sourceReadValues: values.bindings,
+  };
+};
+
+const evaluateBranches = (
+  node: t.ConditionalExpression | t.LogicalExpression,
+  context: EvaluationContext,
+): JavaScriptSemanticValue => {
+  const readContext = sourceReadContextAt(context, context.capturePoint);
+  if (t.isLogicalExpression(node)) return evaluateLogical(node, readContext);
+  const test = primitiveCandidates(
+    evaluateExpression(node.test, nestedContext(readContext)),
+  );
+  if (test !== null && test.length > 0) {
+    const truth = Boolean(test[0]);
+    if (test.every((value) => Boolean(value) === truth))
+      return evaluateExpression(
+        truth ? node.consequent : node.alternate,
+        nestedContext(readContext),
+      );
+  }
+  return mergeValues([
+    evaluateExpression(node.consequent, nestedContext(readContext)),
+    evaluateExpression(node.alternate, nestedContext(readContext)),
+  ]);
+};
+
+const evaluateLogical = (
+  node: t.LogicalExpression,
+  context: EvaluationContext,
+): JavaScriptSemanticValue => {
+  const left = evaluateExpression(node.left, nestedContext(context));
+  const candidates = primitiveCandidates(left);
+  if (candidates === null || candidates.length === 0)
+    return mergeValues([
+      left,
+      evaluateExpression(node.right, nestedContext(context)),
+    ]);
+  // Retain only left candidates returned by the operator. The others reach
+  // the right operand, whose value replaces them rather than joining them.
+  const retained = candidates.filter((value) =>
+    node.operator === "??"
+      ? value !== null
+      : node.operator === "||"
+        ? Boolean(value)
+        : !value,
+  );
+  if (retained.length === candidates.length) return left;
+  const right = evaluateExpression(node.right, nestedContext(context));
+  return retained.length === 0
+    ? right
+    : mergeValues([primitiveSet(retained), right]);
 };
 
 const evaluateTemplate = (
@@ -1086,6 +1194,9 @@ const nestedContext = (context: EvaluationContext): EvaluationContext => ({
   bindings: context.bindings,
   dependence: context.dependence,
   memo: context.memo,
+  ...(context.sourceReadValues === undefined
+    ? {}
+    : { sourceReadValues: context.sourceReadValues }),
 });
 
 const isPrimitive = (value: JavaScriptSemanticValue): boolean =>
@@ -1104,10 +1215,14 @@ const captureContextAt = (
   context: EvaluationContext,
 ): EvaluationContext | undefined => {
   if (
-    context.capturePoint !== undefined ||
+    context.capturePoint === node ||
+    (context.sourceReadValues === undefined &&
+      context.capturePoint !== undefined) ||
     semanticCapturePosition(node, context.state.parentsByNode) === null
   )
     return undefined;
+  if (context.sourceReadValues !== undefined)
+    return sourceReadContextAt(context, node);
   let captures = capturedBindingValuesByState.get(context.state);
   if (captures === undefined) {
     captures = new WeakMap();
@@ -1128,7 +1243,8 @@ const evaluateCapturedExpression = (
   // A literal field captures its primitive at construction, even when its
   // containing object is subsequently read at another capture point.
   let values = primitiveExpressionValuesByState.get(context.state);
-  const cached = values?.get(node);
+  const cached =
+    context.sourceReadValues === undefined ? values?.get(node) : undefined;
   if (cached !== undefined) return cached;
   let value = evaluateExpression(node, context);
   if (!isPrimitive(value)) {
@@ -1140,7 +1256,11 @@ const evaluateCapturedExpression = (
   }
   // Never publish values evaluated at somebody else's capture point. Like
   // binding caches, these entries are discarded whenever effects change.
-  if (context.capturePoint === undefined && isPrimitive(value)) {
+  if (
+    context.capturePoint === undefined &&
+    context.sourceReadValues === undefined &&
+    isPrimitive(value)
+  ) {
     if (values === undefined) {
       values = new WeakMap();
       primitiveExpressionValuesByState.set(context.state, values);
