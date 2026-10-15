@@ -21,6 +21,7 @@ import {
   semanticStaticPropertyKey,
   semanticWriteTargets,
   unwrapJavaScriptExpression,
+  javaScriptOptionalOperandsMayBeSkipped,
 } from "./javascriptAstValues.js";
 import type {
   JavaScriptSemanticAnalysisState,
@@ -62,7 +63,10 @@ import {
   electronMemberPath,
   ELECTRON_MODULE,
 } from "./javascriptElectronMemberWrites.js";
-import { range } from "./javascriptStaticAnalysisHelpers.js";
+import {
+  isWebSocketEndpointCandidate,
+  range,
+} from "./javascriptStaticAnalysisHelpers.js";
 import { semanticCoverage } from "./javascriptSemanticCoverage.js";
 import {
   parseJavaScriptSource,
@@ -238,6 +242,8 @@ export type JavaScriptOpenReceiverFact =
 export interface JavaScriptReceiverFacts {
   readonly openReceivers: ReadonlyMap<number, JavaScriptOpenReceiverFact>;
   readonly rpcClientRoots: ReadonlySet<t.Node>;
+  /** This syntax needs ambient-write facts before endpoint interpretation. */
+  readonly hasWebSocketEndpointCandidate: boolean;
 }
 
 export interface JavaScriptReceiverIndex extends JavaScriptBindingIndex {
@@ -281,6 +287,7 @@ function* classifyDefinitionReceiversSteps(
   const extensionStateReads: number[] = [];
   const roots = new Set<t.Node>();
   const clients = new Map<string, boolean>();
+  let hasWebSocketEndpointCandidate = false;
   const classifyRpcRoot = (node: t.Node): void => {
     if (!t.isMemberExpression(node) && !t.isOptionalMemberExpression(node))
       return;
@@ -380,6 +387,13 @@ function* classifyDefinitionReceiversSteps(
   };
   yield* traverseJavaScriptAstSteps(program, {
     enter: (node) => {
+      if (
+        (t.isCallExpression(node) ||
+          t.isOptionalCallExpression(node) ||
+          t.isNewExpression(node)) &&
+        isWebSocketEndpointCandidate(node.callee, state)
+      )
+        hasWebSocketEndpointCandidate = true;
       classifyRpcRoot(node);
       classifyOpenReceiver(node);
     },
@@ -387,7 +401,11 @@ function* classifyDefinitionReceiversSteps(
   if (extensionStateReads.length > 0 && importsVsCodeModule(state))
     for (const start of extensionStateReads)
       facts.set(start, "extension-state");
-  return { openReceivers: facts, rpcClientRoots: roots };
+  return {
+    openReceivers: facts,
+    rpcClientRoots: roots,
+    hasWebSocketEndpointCandidate,
+  };
 }
 
 /** VS Code passes extension state through ExtensionContext, not an import. */
@@ -697,6 +715,7 @@ const createState = (
     staticImportResolutionMode,
     valueResourceLimits: new Set(),
     parentsByNode: new WeakMap(),
+    awaitSites: [],
     scopes: [root],
     scopesById: new Map([[root.scopeId, root]]),
     scopeByNode: new WeakMap([[program, root]]),
@@ -736,6 +755,7 @@ function* collectDefinitionsSteps(
   yield* traverseJavaScriptAstSteps(program, {
     enter: (node, parent, readAncestors) => {
       if (parent !== null) state.parentsByNode.set(node, parent);
+      if (t.isAwaitExpression(node)) state.awaitSites.push(node);
       let parentScope = currentSemanticScope(stack);
       if (
         parent !== null &&
@@ -924,32 +944,15 @@ const isSkippedBranch = (parent: t.Node, child: t.Node): boolean => {
   if (t.isOptionalCallExpression(parent) || t.isCallExpression(parent))
     return (
       parent.arguments.includes(child as t.Expression) &&
-      optionalCallArgumentsMayBeSkipped(parent)
+      javaScriptOptionalOperandsMayBeSkipped(parent)
     );
   if (t.isOptionalMemberExpression(parent))
-    return parent.optional && parent.computed && child === parent.property;
+    return (
+      parent.computed &&
+      child === parent.property &&
+      javaScriptOptionalOperandsMayBeSkipped(parent)
+    );
   return false;
-};
-
-const optionalCallArgumentsMayBeSkipped = (
-  call: t.CallExpression | t.OptionalCallExpression,
-): boolean => {
-  if (t.isOptionalCallExpression(call) && call.optional) return true;
-  let callee: t.Node = call.callee;
-  while (true) {
-    // Parentheses terminate optional-chain short-circuiting. In particular,
-    // `(foo?.bar)(arg)` evaluates arg before attempting the call.
-    if (callee.extra?.parenthesized === true) return false;
-    if (t.isOptionalMemberExpression(callee)) {
-      if (callee.optional) return true;
-      callee = callee.object;
-    } else if (t.isMemberExpression(callee)) callee = callee.object;
-    else if (t.isOptionalCallExpression(callee)) {
-      if (callee.optional) return true;
-      callee = callee.callee;
-    } else if (t.isCallExpression(callee)) callee = callee.callee;
-    else return false;
-  }
 };
 
 const bindOuterDeclaration = (
@@ -1030,7 +1033,6 @@ const bindImportEquals = (
   state: JavaScriptSemanticAnalysisState,
 ): void => {
   const specifier = semanticImportEqualsSpecifier(node);
-  if (specifier === null) return;
   addBinding({
     state,
     scope,
@@ -1039,7 +1041,15 @@ const bindImportEquals = (
     mutable: false,
     definitionNode: node.id,
     initializer: null,
-    directOrigin: { specifier, importedPath: [], resolutionMode: "require" },
+    ...(specifier === null
+      ? {}
+      : {
+          directOrigin: {
+            specifier,
+            importedPath: [],
+            resolutionMode: "require" as const,
+          },
+        }),
   });
 };
 
