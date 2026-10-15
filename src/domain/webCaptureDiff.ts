@@ -181,19 +181,7 @@ const compareWebCaptureDimensions = (
   const after = input.after.inspection;
   return {
     dom_structure: domDimension(before, after),
-    scripts: compareDimension(
-      keyed(
-        before.scripts.items.map(scriptProjection),
-        (item) => item.script_key,
-      ),
-      keyed(
-        after.scripts.items.map(scriptProjection),
-        (item) => item.script_key,
-      ),
-      sectionsComplete(before, ["scripts"]) &&
-        sectionsComplete(after, ["scripts"]),
-      "Script inventory was incomplete in at least one observation.",
-    ),
+    scripts: scriptDimension(before, after),
     resources: compareDimension(
       keyed(before.resources, (item) => item.resource_key),
       keyed(after.resources, (item) => item.resource_key),
@@ -214,6 +202,63 @@ const compareWebCaptureDimensions = (
     accessibility: accessibilityDimension(before, after),
     storage: storageDimension(before, after),
   };
+};
+
+const scriptDimension = (
+  before: WebPageInspection,
+  after: WebPageInspection,
+): Dimension => {
+  const inventoryComplete =
+    sectionsComplete(before, ["scripts"]) &&
+    sectionsComplete(after, ["scripts"]);
+  const afterScripts = new Map(
+    after.scripts.items.map((script) => [script.script_key, script]),
+  );
+  // Source-sorted occurrence keys can shift after omissions; even a bare key
+  // may represent the only retained member of a larger duplicate group.
+  const sourceGroup = (key: string) => key.replace(/_[0-9]+$/u, "");
+  const incompleteSourceGroups = new Set(
+    [...before.scripts.items, ...after.scripts.items]
+      .filter((script) => !script.source.included)
+      .map((script) => sourceGroup(script.script_key)),
+  );
+  const comparableSources = new Set(
+    before.scripts.items
+      .filter(
+        (script) =>
+          inventoryComplete &&
+          !incompleteSourceGroups.has(sourceGroup(script.script_key)) &&
+          script.source.included &&
+          afterScripts.get(script.script_key)?.source.included,
+      )
+      .map((script) => script.script_key),
+  );
+  const project = (inspection: WebPageInspection) =>
+    keyed(
+      inspection.scripts.items.map((script) => ({
+        ...scriptProjection(script),
+        source_sha256:
+          comparableSources.has(script.script_key) && script.source.included
+            ? script.source.artifact.sha256
+            : null,
+      })),
+      (script) => script.script_key,
+    );
+  const contentComplete = before.scripts.items.every((script) => {
+    const other = afterScripts.get(script.script_key);
+    return (
+      other === undefined ||
+      (script.cdp_hash !== null && other.cdp_hash !== null) ||
+      comparableSources.has(script.script_key)
+    );
+  });
+  return compareDimension(
+    project(before),
+    project(after),
+    inventoryComplete && contentComplete,
+    "Script inventory or content identity was incomplete in at least one observation.",
+    inventoryComplete,
+  );
 };
 
 const keyed = <T>(
